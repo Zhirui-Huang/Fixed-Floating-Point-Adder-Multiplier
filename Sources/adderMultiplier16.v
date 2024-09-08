@@ -82,6 +82,11 @@ endmodule
 
 //float multi multiplier floating point numbers.
 module float_multi(num1, num2, result, overflow, zero, NaN, precisionLost);
+  `ifdef flp16
+    localparam sign_bit = 1;
+    localparam exp_bit = 5;
+    localparam fra_bit = 10;
+  `endif flp16
   //Operands
   input [15:0] num1, num2;
   output [15:0] result;
@@ -92,24 +97,24 @@ module float_multi(num1, num2, result, overflow, zero, NaN, precisionLost);
   output precisionLost;
   //Decode numbers
   wire sign1, sign2, signR; //hold signs
-  wire [4:0] ex1, ex2, exR; //hold exponents
-  wire [4:0] ex1_pre, ex2_pre, exR_calc; //hold exponents
-  reg [4:0] exSubCor;
-  wire [4:0] exSum_fault;
+  wire [exp_bit-1:0] ex1, ex2, exR; //hold exponents
+  wire [exp_bit-1:0] ex1_pre, ex2_pre, exR_calc; //hold exponents
+  reg [exp_bit-1:0] exSubCor;
+  wire [exp_bit-1:0] exSum_fault;
   wire ex_cannot_correct;
-  wire [9:0] fra1, fra2, fraR; //hold fractions
-  reg [9:0] fraSub, fraSub_corrected;
-  wire [20:0] float1;
-  wire [10:0] float2;
+  wire [fra_bit-1:0] fra1, fra2, fraR; //hold fractions
+  reg [fra_bit-1:0] fraSub, fraSub_corrected;
+  wire [fra_bit:0] float1;
+  wire [fra_bit*2:0] float2;
   wire exSum_sign;
-  wire [6:0] exSum;
-  wire [5:0] exSum_prebais, exSum_abs; //exponent sum
+  wire [exp_bit+1:0] exSum; // exponent sum - bias
+  wire [exp_bit:0] exSum_prebais, exSum_abs; //exponent sum
   wire [11:0] float_res, float_res_preround; //result
   wire [9:0] float_res_fra;
   wire [9:0] dump_res; //Lost precision
   reg [21:0] res_full;
   wire [21:0] res_full_preshift;
-  reg [20:0] mid[10:0];
+  reg [20:0] mid[10:0]; // 乘法的中间结果
   wire inf_num; //at least on of the operands is inf.
   wire subNormal;
   wire zero_num_in, zero_calculated;
@@ -130,14 +135,14 @@ module float_multi(num1, num2, result, overflow, zero, NaN, precisionLost);
   //decode-encode numbers
   assign {sign1, ex1_pre, fra1} = num1;
   assign {sign2, ex2_pre, fra2} = num2;
-  assign ex1 = ex1_pre + {4'd0, ~|ex1_pre};
+  assign ex1 = ex1_pre + {4'd0, ~|ex1_pre}; // 确保 ex1非 0，如果是 0，则+1
   assign ex2 = ex2_pre + {4'd0, ~|ex2_pre};
   assign result = {signR, exR, fraR};
   
   //exponentials are added
-  assign exSum = exSum_prebais - 7'd15;
+  assign exSum = exSum_prebais - 7'd15; // ex1+ex2-max
   assign exSum_prebais = {1'b0,ex1} + {1'b0,ex2};
-  assign exSum_abs = (exSum_sign) ? (~exSum[5:0] + 6'd1) : exSum[5:0];
+  assign exSum_abs = (exSum_sign) ? (~exSum[5:0] + 6'd1) : exSum[5:0];  // 对偏差前后的数值求绝对值
   assign exSum_sign = exSum[6];
 
   //Get floating numbers
@@ -145,18 +150,21 @@ module float_multi(num1, num2, result, overflow, zero, NaN, precisionLost);
   assign float2 = {|ex2_pre, fra2};
 
   //Calculate result
-  assign signR = (sign1 ^ sign2);
+  assign signR = (sign1 ^ sign2); // sign1 xor sign2
   assign exR_calc = exSum[4:0] + {4'd0, float_res[11]} + (~exSubCor & {5{subNormal}}) + {4'd0, subNormal};
   assign exR = (exR_calc | {5{overflow}}) & {5{~(zero | exSum_sign | ex_cannot_correct)}};
+  // if ex1+ex2-max<0, the result is from shifted res(res_full)
+  // else if is subnormal, the result is from fraSub_corrected
+  // else the result from float_res_fra, which is high 11bits of the rounded data
   assign fraR = ((exSum_sign) ? res_full[20:11] :((subNormal) ? fraSub_corrected : float_res_fra)) & {10{~(zero | overflow)}} ;
-  assign float_res_fra = (float_res[11]) ? float_res[10:1] : float_res[9:0];
-  assign float_res = float_res_preround + {10'd0,dump_res[9]}; //? possibly generates wrong result due to overflow
-  assign {float_res_preround, dump_res} = res_full_preshift;
-  assign res_full_preshift = mid[0] + mid[1] + mid[2] + mid[3] + mid[4] + mid[5] + mid[6] + mid[7] + mid[8] + mid[9] + mid[10];
+  assign float_res_fra = (float_res[11]) ? float_res[10:1] : float_res[9:0];  // float_res_fra[9:0], 根据符号计算余数
+  assign float_res = float_res_preround + {10'd0,dump_res[9]}; //? possibly generates wrong result due to overflow, rounding, [10:0]
+  assign {float_res_preround, dump_res} = res_full_preshift;  // {[11:0], [9:0]}
+  assign res_full_preshift = mid[0] + mid[1] + mid[2] + mid[3] + mid[4] + mid[5] + mid[6] + mid[7] + mid[8] + mid[9] + mid[10]; // fraction mul result
   assign exSum_fault = exSubCor - exSum_abs[4:0];
   always@*
     begin
-      if(exSum_sign)
+      if(exSum_sign)  // if ex1+ex2-max<0, need shifted
         case(exSum_abs)
           6'h0: res_full = res_full_preshift;
           6'h1: res_full = (res_full_preshift >> 1);
@@ -201,7 +209,7 @@ module float_multi(num1, num2, result, overflow, zero, NaN, precisionLost);
 
   always@* //create mids from fractions
     begin
-      mid[0] = (float1 >> 10) & {21{float2[0]}};
+      mid[0] = (float1 >> 10) & {21{float2[0]}};  // mid[0]([20:0]) = 
       mid[1] = (float1 >> 9)  & {21{float2[1]}};
       mid[2] = (float1 >> 8)  & {21{float2[2]}};
       mid[3] = (float1 >> 7)  & {21{float2[3]}};
